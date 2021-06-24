@@ -1,23 +1,28 @@
 (ns jepsen.ocons
   (:require [clojure.tools.logging :refer :all]
             [clojure.string :as str]
-            [jepsen [cli :as cli]
+            [jepsen 
+             [checker :as checker]
+             [cli :as cli]
              [client :as client]
              [control :as c]
              [db :as db]
              [tests :as tests]
              [generator :as gen]
+             [nemesis :as nemesis]
              ]
             [jepsen.control.util :as cu]
             [jepsen.os.debian :as debian]
             [knossos.model :as model]
             [cheshire.core :as json]
-            ))
+            )
+  (:use [slingshot.slingshot :only [throw+ try+]]))
 
 (def dir    "/opt/ocons/")
 (def binary "ocons-main.exe")
 (def client-bin "ocons-client.exe")
 (def logfile (str dir "ocons.log"))
+(def loggerfile (str dir "ocons.logger"))
 (def pidfile (str dir "ocons.pid"))
 
 (defn node-url
@@ -73,10 +78,12 @@
         (initial-cluster test)
         (str dir "data")
         client-port peer-port
-        5 0.1 
+        5 1 
         :-s 500
+        :-log-level :info
+        :-log-to-file loggerfile
       )
-      (Thread/sleep 10000)
+      (Thread/sleep 1000)
       )
    (teardown! [_ test node]
       (info node "tearing down ocons")
@@ -84,11 +91,20 @@
       (c/su (c/exec :rm :-rf dir))
       )
    db/LogFiles
-   (log-files [_ test node] [logfile (str dir "logger")])
+   (log-files [_ test node] [logfile loggerfile])
    ))
 
 (defn r [_ _] {:type :invoke, :f :read, :value nil})
 (defn w [_ _] {:type :invoke, :f :write, :value (rand-int 5)})
+(defn cas [_ _] {:type :invoke, :f :cas, :value [(rand-int 5) (rand-int 5)]})
+
+(def not-found-pattern
+  "OCons returns the following when a key does not exist"
+  (re-pattern "Key not found"))
+
+(def cas-pattern
+  "OCons returns following error for CAS failed"
+  (re-pattern "Key \\(.*\\) has value \\(.*\\) rather than \\(.*\\)"))
 
 (defn ocons-get!
   "Get a value for a key"
@@ -110,31 +126,66 @@
         )
   )
 
-(defrecord Client [k node]
+(defn ocons-cas!
+  "Compare and swap operation"
+  [node test key value_new value_old]
+  (try+
+    (c/on node
+          (c/su
+            (c/exec (str dir client-bin) :cas (client-server-addrs test) (c/lit key) (c/lit value_new) (c/lit value_old))
+            )
+          )
+        (catch [:type :jepsen.control/nonzero-exit] ex
+          (do 
+            (info (:err ex))
+            (if (re-find cas-pattern (:err ex))
+              false
+              (throw+))
+            )
+      )
+    )
+  )
+
+(defn parse-long
+  "Parses a string to a long. Passes through `nil`."
+  [s]
+  (info "parse-long" s)
+  (when s 
+    (if (not (= "null" s))
+      (Long/parseLong s)
+      nil
+      )
+    )
+  )
+
+
+(defrecord Client [k conn]
   client/Client
 
   (open! [this test node]
-    (assoc this :node node)
+    (assoc this :conn node)
     )
 
   (close! [_ _] )
 
   (setup! [this test]
     (do
-      (ocons-set! (:client this) test k (json/generate-string nil))
+      (info "Setting up client")
+      (ocons-set! conn test k (json/generate-string nil))
       ))
 
   (invoke! [client test op]
-    (let [node (:node client)]
-      (case (:f op)
-        :read  (let [resp (ocons-get! node test k)]
-                 (assoc op :type :ok :value resp)
-                 )
-        :write  (do (->> (:value op)
-                         json/generate-string
-                         (ocons-set! node test k))
-                    (assoc op :type :ok))
-        )
+    (case (:f op)
+      :read  (let [resp (ocons-get! conn test k)]
+               (assoc op :type :ok :value (parse-long resp))
+               )
+      :write  (do (->> (:value op)
+                       json/generate-string
+                       (ocons-set! conn test k))
+                  (assoc op :type :ok))
+      :cas ( let [[value value'] (:value op)
+                  ok? (ocons-cas! conn test k (json/generate-string value) (json/generate-string value'))]
+             (assoc op :type (if ok? :ok :fail)))
       )
     )
 
@@ -150,10 +201,19 @@
           :db (db "paxos")
           :pure-generators true
           :client (Client. "/jepsen" nil)
-          :generator (->> (gen/mix [r w])
+          :nemesis (nemesis/partition-random-halves)
+          :checker (checker/linearizable
+                     {:model (model/cas-register)
+                      :algorithm :linear})
+          :generator (->> (gen/mix [r w cas])
                           (gen/stagger 1)
-                          (gen/nemesis nil)
-                          (gen/time-limit 15))
+                          (gen/nemesis 
+                            (cycle [(gen/sleep 5)
+                                    {:type :info, :f :start}
+                                    (gen/sleep 5)
+                                    {:type :info, :f :stop}
+                                    ]))
+                          (gen/time-limit (:time-limit opts)))
           }
          ))
 
